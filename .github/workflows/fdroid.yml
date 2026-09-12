@@ -1,7 +1,7 @@
 name: Build F-Droid repo
+
+# Запуск только вручную из вкладки Actions
 on:
-  push:
-    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -13,25 +13,95 @@ concurrency:
   group: fdroid-repo
   cancel-in-progress: true
 
+env:
+  # Значения по умолчанию на случай, если variables не заданы
+  FDROID_REPO_NAME: My F-Droid Repo
+  FDROID_REPO_DESCRIPTION: Автоматически собираемый F-Droid репозиторий.
+
 jobs:
   build:
     runs-on: ubuntu-latest
     environment:
       name: github-pages
-      url: ${{ steps.deploy.outputs.page_url }}
+      url: ${{ steps.repo-url.outputs.url }}
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout
+        uses: actions/checkout@v4
 
-      - uses: actions/setup-python@v5
+      - name: Setup Python
+        uses: actions/setup-python@v5
         with:
           python-version: '3.12'
 
-      - name: Install deps
+      - name: Install dependencies
         run: pip install requests pyyaml pillow pyaxmlparser
+
+      - name: Compute repo URL and generate config.yml
+        id: repo-url
+        env:
+          GH_REPOSITORY: ${{ github.repository }}
+          REPO_NAME: ${{ vars.FDROID_REPO_NAME || env.FDROID_REPO_NAME }}
+          REPO_DESCRIPTION: ${{ vars.FDROID_REPO_DESCRIPTION || env.FDROID_REPO_DESCRIPTION }}
+        run: |
+          OWNER="${GH_REPOSITORY%/*}"
+          NAME="${GH_REPOSITORY#*/}"
+
+          # ПРОВЕРКА ИМЕНИ РЕПОЗИТОРИЯ:
+          # 1) <owner>.github.io -> сайт в корне домена,
+          #    содержимое кладём в подпапку repo,
+          #    итоговый путь: https://owner.github.io/repo/
+          # 2) имя "repo" -> содержимое артефакта в корне сайта,
+          #    итоговый путь оканчивается на /repo за счёт имени репозитория:
+          #    https://owner.github.io/repo/
+          # 3) любое другое имя -> содержимое кладём в подпапку repo:
+          #    https://owner.github.io/<имя>/repo/
+          LOWER_NAME="$(echo "$NAME" | tr '[:upper:]' '[:lower:]')"
+          LOWER_OWNER="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+
+          if [ "$LOWER_NAME" = "$LOWER_OWNER.github.io" ]; then
+            BASE=""
+            ROOT_DEPLOY="false"
+          elif [ "$LOWER_NAME" = "repo" ]; then
+            BASE="/$NAME"
+            ROOT_DEPLOY="true"
+          else
+            BASE="/$NAME"
+            ROOT_DEPLOY="false"
+          fi
+
+          URL="https://$OWNER.github.io$BASE/"
+          if [ "$ROOT_DEPLOY" = "false" ]; then
+            URL="${URL}repo/"
+          fi
+
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "root_deploy=$ROOT_DEPLOY" >> "$GITHUB_OUTPUT"
+
+          # Экранируем одинарные кавычки для безопасной подстановки в YAML
+          ESC_NAME="$(printf '%s' "$REPO_NAME" | sed "s/'/''/g")"
+          ESC_DESC="$(printf '%s' "$REPO_DESCRIPTION" | sed "s/'/''/g")"
+
+          cat > config.yml <<EOF
+          repo_url: ${URL%/}
+          repo_name: '${ESC_NAME}'
+          repo_description: >-
+            ${ESC_DESC}
+          keystore: 'keystore.jks'
+          keystorepass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+          keystorekeypass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+          EOF
+
+          echo "Repo URL: $URL"
+          echo "Repo name: $REPO_NAME"
+          if [ "$ROOT_DEPLOY" = "true" ]; then
+            echo "Deploy mode: корень сайта"
+          else
+            echo "Deploy mode: подпапка /repo"
+          fi
 
       - name: Sync apps (metadata + APKs)
         env:
-          GITHUB_TOKEN: ${{ secrets.FDROID_PAT }}   # PAT с публичным доступом к API
+          GITHUB_TOKEN: ${{ secrets.FDROID_PAT }}
         run: python scripts/build_repo.py
 
       - name: Restore keystore
@@ -46,12 +116,25 @@ jobs:
           fdroid update --pretty
 
       - name: Assemble site
+        env:
+          ROOT_DEPLOY: ${{ steps.repo-url.outputs.root_deploy }}
         run: |
-          mkdir -p site && cp -r repo site/repo
+          mkdir -p site
+          if [ "$ROOT_DEPLOY" = "true" ]; then
+            # содержимое каталога repo ложится прямо в корень сайта,
+            # путь оканчивается на /repo за счёт имени репозитория
+            cp -a repo/. site/
+          else
+            # содержимое каталога repo заворачиваем в подпапку repo,
+            # чтобы путь всегда оканчивался на /repo
+            cp -a repo site/repo
+          fi
 
-      - uses: actions/upload-pages-artifact@v3
+      - name: Upload Pages artifact
+        uses: actions/upload-pages-artifact@v3
         with:
           path: site
 
-      - id: deploy
+      - name: Deploy to GitHub Pages
+        id: deploy
         uses: actions/deploy-pages@v4
