@@ -17,6 +17,8 @@ env:
   # Значения по умолчанию на случай, если variables не заданы
   FDROID_REPO_NAME: My F-Droid Repo
   FDROID_REPO_DESCRIPTION: Автоматически собираемый F-Droid репозиторий.
+  # Алиас ключа внутри keystore (совпадает с -alias из команды keytool)
+  FDROID_KEY_ALIAS: fdroid
 
 jobs:
   build:
@@ -42,6 +44,7 @@ jobs:
           GH_REPOSITORY: ${{ github.repository }}
           REPO_NAME: ${{ vars.FDROID_REPO_NAME || env.FDROID_REPO_NAME }}
           REPO_DESCRIPTION: ${{ vars.FDROID_REPO_DESCRIPTION || env.FDROID_REPO_DESCRIPTION }}
+          KEY_ALIAS: ${{ vars.FDROID_KEY_ALIAS || env.FDROID_KEY_ALIAS }}
         run: |
           OWNER="${GH_REPOSITORY%/*}"
           NAME="${GH_REPOSITORY#*/}"
@@ -80,16 +83,26 @@ jobs:
           # Экранируем одинарные кавычки для безопасной подстановки в YAML
           ESC_NAME="$(printf '%s' "$REPO_NAME" | sed "s/'/''/g")"
           ESC_DESC="$(printf '%s' "$REPO_DESCRIPTION" | sed "s/'/''/g")"
+          ESC_ALIAS="$(printf '%s' "$KEY_ALIAS" | sed 's/[^a-zA-Z0-9_-]//g')"
 
           cat > config.yml <<EOF
           repo_url: ${URL%/}
           repo_name: '${ESC_NAME}'
           repo_description: >-
             ${ESC_DESC}
+          repo_icon: fdroid-icon.png
+          # --- ключ для подписи индекса репозитория ---
           keystore: 'keystore.jks'
+          repo_keyalias: ${ESC_ALIAS}
+          keypass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+          repo_keypass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
+          # --- пароли keystore (для сборки приложений, оставлены на будущее) ---
           keystorepass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
           keystorekeypass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
           EOF
+
+          # fdroid требует права 0600 на config.yml с паролями
+          chmod 600 config.yml
 
           echo "Repo URL: $URL"
           echo "Repo name: $REPO_NAME"
@@ -107,7 +120,9 @@ jobs:
       - name: Restore keystore
         env:
           KEYSTORE: ${{ secrets.FDROID_KEYSTORE }}
-        run: echo "$KEYSTORE" | base64 -d > keystore.jks
+        run: |
+          echo "$KEYSTORE" | base64 -d > keystore.jks
+          chmod 600 keystore.jks
 
       # Образ docker-executable-fdroidserver имеет ENTRYPOINT "fdroid",
       # поэтому аргументы передаются БЕЗ слова fdroid в начале.
@@ -127,10 +142,13 @@ jobs:
             # содержимое каталога repo ложится прямо в корень сайта,
             # путь оканчивается на /repo за счёт имени репозитория
             cp -a repo/. site/
+            # иконка репозитория должна попасть в корень сайта
+            [ -f fdroid-icon.png ] && cp fdroid-icon.png site/fdroid-icon.png || true
           else
             # содержимое каталога repo заворачиваем в подпапку repo,
             # чтобы путь всегда оканчивался на /repo
             cp -a repo site/repo
+            [ -f fdroid-icon.png ] && cp fdroid-icon.png site/repo/fdroid-icon.png || true
           fi
 
       - name: Upload Pages artifact
