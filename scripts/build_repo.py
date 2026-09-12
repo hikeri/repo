@@ -19,17 +19,9 @@ ANTI_MAP = {  # имя файла -> канонический AntiFeature из f
     "non-free-network": "NonFreeNet", "no-sources": "NoSourceSince",
     "tethered-network": "TetheredNet", "tracking": "Tracking",
 }
-ANTI_LABELS = {  # человекочитаемые подписи для описания
-    "Ads": "Advertising", "DisabledAlgorithm": "Signed using an unsafe algorithm",
-    "KnownVuln": "Known security vulnerability", "NonFreeAdd": "Non-Free Addons",
-    "NonFreeAssets": "Non-Free Assets", "NonFreeDep": "Non-Free Dependencies",
-    "NonFreeNet": "Non-Free Network Services", "NoSourceSince": "No Source Since",
-    "TetheredNet": "Tethered Network Services", "Tracking": "Tracking",
-}
 LANG_ALIASES = {"ru": "ru-RU", "pt": "pt-BR", "zh": "zh-CN", "no": "nb"}
 SHOT_RE = re.compile(r"^(\d+)(?:\.([a-z]{2}(?:[-_][A-Za-z]{2})?))?\.(jpe?g|png)$", re.I)
 LANG_SUFFIX = re.compile(r"^[a-z]{2}(_[A-Z]{2}|-[A-Za-z]{2})?$")
-
 
 def norm_lang(code):
     code = code.replace("_", "-")
@@ -40,7 +32,6 @@ def norm_lang(code):
         return f"{l}-{r.upper()}"
     return code
 
-
 def split_lang(stem):
     """'description.ru' -> ('description', 'ru'); 'description' -> (..., None)"""
     if "." in stem:
@@ -48,7 +39,6 @@ def split_lang(stem):
         if LANG_SUFFIX.match(lang):
             return base, norm_lang(lang)
     return stem, None
-
 
 def parse_app(d: Path):
     """Читает всю структуру папки приложения."""
@@ -84,17 +74,21 @@ def parse_app(d: Path):
                 banners[lang] = (ext, f)
     return text, sorted(shots, key=lambda s: (s["lang"], s["num"], s["png_last"])), icons, banners
 
-
 def gh(url):
     r = S.get(url, timeout=120)
     r.raise_for_status()
     return r.json()
 
-
 def save_img_as_png(src: Path, dst: Path):
     dst.parent.mkdir(parents=True, exist_ok=True)
     Image.open(src).convert("RGBA" if src.suffix == ".png" else "RGB").save(dst, "PNG")
 
+def changelog_text(rel):
+    """Формирует текст changelog из релиза GitHub."""
+    title = f"Version {rel.get('name') or rel['tag_name']}"
+    if rel["prerelease"]:
+        title += " (pre-release)"
+    return (title + "\n\n" + (rel.get("body") or "").strip()).strip()
 
 def process_app(d: Path):
     appid = d.name
@@ -124,7 +118,7 @@ def process_app(d: Path):
         print(f"[SKIP] {appid}: нет релизов с APK"); return
 
     # --- скачиваем APK ---
-    seen_vc, stable_vc = set(), 0
+    seen_vc, apk_entries = set(), []
     for rel in rels:
         tag = rel["tag_name"]
         for asset in rel["assets"]:
@@ -145,40 +139,45 @@ def process_app(d: Path):
             seen_vc.add(vc)
             final = REPO_DIR / f"{pkg}_{vc}.apk"
             shutil.move(tmp, final)
-            if not rel["prerelease"]:          # рекомендуемая версия = стабильная
-                stable_vc = max(stable_vc, vc)
-            # --- changelog из тела релиза ---
-            for lang, data in text.items():
-                cl = METADATA_DIR / appid / lang / "changelogs" / f"{vc}.txt"
-                cl.parent.mkdir(parents=True, exist_ok=True)
-                title = f"Version {rel.get('name') or tag}"
-                if rel["prerelease"]:
-                    title += " (pre-release)"
-                cl.write_text(title + "\n\n" + (rel.get("body") or "").strip(),
-                              encoding="utf-8")
-    if stable_vc == 0:
-        stable_vc = max(seen_vc)               # стабильных нет — берём максимум
+            apk_entries.append({
+                "version_code": vc,
+                "version_name": str(getattr(apk, "version_name", "") or
+                                    rel.get("name") or tag),
+                "changelog": changelog_text(rel),
+                "prerelease": rel["prerelease"],
+            })
+    apk_entries.sort(key=lambda e: e["version_code"], reverse=True)
+
+    # рекомендуемая версия = последняя СТАБИЛЬНАЯ (пре-релизы не рекомендуются)
+    stable = [e for e in apk_entries if not e["prerelease"]]
+    stable_vc = stable[0]["version_code"] if stable else apk_entries[0]["version_code"]
+    stable_entry = (stable[0] if stable else apk_entries[0])
 
     # --- метаданные ---
+    all_antifeatures = []
     for lang, data in text.items():
         loc = METADATA_DIR / appid / lang
         loc.mkdir(parents=True, exist_ok=True)
+
+        # описания: первая строка -> краткое, остальное -> полное
         desc = data.get("description", "")
         lines = desc.split("\n")
         (loc / "short_description.txt").write_text(
             lines[0].strip()[:80], encoding="utf-8")
         full = "\n".join(lines[1:]).strip()
-
-        antifeatures, reasons = [], []
-        for fname, afeat in ANTI_MAP.items():
-            if fname in data:
-                antifeatures.append(afeat)
-                reasons.append((afeat, data[fname]))
-        if reasons:
-            full += "\n\n<b>Anti-features:</b>\n" + "\n".join(
-                f"• <b>{ANTI_LABELS[a]}</b>: {r}" for a, r in reasons)
         if full:
             (loc / "full_description.txt").write_text(full, encoding="utf-8")
+
+        # АнТИФИЧИ: локализованные файлы причин -> клиент показывает
+        # их как родные пометки антифич, а не как текст в описании
+        for fname, afeat in ANTI_MAP.items():
+            if fname in data:
+                if afeat not in all_antifeatures:
+                    all_antifeatures.append(afeat)
+                af_dir = loc / "antifeatures"
+                af_dir.mkdir(parents=True, exist_ok=True)
+                (af_dir / f"{afeat}.txt").write_text(
+                    data[fname], encoding="utf-8")
 
         # графика
         imgs = loc / "images"
@@ -193,22 +192,39 @@ def process_app(d: Path):
             shot_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy(shot["path"], shot_dir / f"{i}{shot['path'].suffix.lower()}")
 
+        # changelog: файл <versionCode>.txt для каждой версии +
+        # default.txt (фолбэк для клиента, механизм fdroidserver)
+        cl_dir = loc / "changelogs"
+        cl_dir.mkdir(parents=True, exist_ok=True)
+        for e in apk_entries:
+            (cl_dir / f"{e['version_code']}.txt").write_text(
+                e["changelog"], encoding="utf-8")
+        (cl_dir / "default.txt").write_text(
+            stable_entry["changelog"], encoding="utf-8")
+
     cats = [c.strip() for c in main.get("categories", "").split(",") if c.strip()]
+
+    # Builds: без этой секции fdroid update НЕ вставляет whatsNew в индекс
+    # (см. update.py: if build["versionCode"] == versionCode ...)
+    builds = [{"versionName": e["version_name"], "versionCode": e["version_code"]}
+              for e in apk_entries]
+
     meta = {
         "License": license_id,
         "SourceCode": github_url,
         "IssueTracker": github_url.rstrip("/") + "/issues",
         "Categories": cats,
+        "Builds": builds,
         "CurrentVersionCode": stable_vc,
     }
-    if antifeatures:
-        meta["AntiFeatures"] = sorted(set(antifeatures))
+    if all_antifeatures:
+        meta["AntiFeatures"] = sorted(all_antifeatures)
     if main.get("website"):
         meta["WebSite"] = main["website"]
     (METADATA_DIR / f"{appid}.yml").write_text(
         yaml.safe_dump(meta, allow_unicode=True, sort_keys=False), encoding="utf-8")
-    print(f"[OK] {appid}: {len(seen_vc)} APK, recommended VC={stable_vc}")
-
+    print(f"[OK] {appid}: {len(apk_entries)} APK, recommended VC={stable_vc}, "
+          f"antifeatures={all_antifeatures}")
 
 if __name__ == "__main__":
     if not APPS_DIR.exists():
