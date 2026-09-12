@@ -119,6 +119,7 @@ def process_app(d: Path):
 
     # --- скачиваем APK ---
     seen_vc, apk_entries = set(), []
+    pkg_name = None
     for rel in rels:
         tag = rel["tag_name"]
         for asset in rel["assets"]:
@@ -139,6 +140,7 @@ def process_app(d: Path):
             seen_vc.add(vc)
             final = REPO_DIR / f"{pkg}_{vc}.apk"
             shutil.move(tmp, final)
+            pkg_name = pkg                     # запоминаем реальный package name
             apk_entries.append({
                 "version_code": vc,
                 "version_name": str(getattr(apk, "version_name", "") or
@@ -155,7 +157,6 @@ def process_app(d: Path):
 
     # --- метаданные ---
     # антифичи: словарь AntiFeature -> locale -> причина
-    # (формат из документации fdroidserver.metadata)
     antifeature_reasons = {}
     for lang, data in text.items():
         loc = METADATA_DIR / appid / lang
@@ -170,8 +171,7 @@ def process_app(d: Path):
         if full:
             (loc / "full_description.txt").write_text(full, encoding="utf-8")
 
-        # АНТИФИЧИ: собираем локализованные причины в словарь для yml
-        # и пишем файлы antifeatures/<AF>.txt (штатный механизм fdroidserver)
+        # АНТИФИЧИ: локализованные причины (штатный механизм fdroidserver)
         for fname, afeat in ANTI_MAP.items():
             if fname in data:
                 antifeature_reasons.setdefault(afeat, {})[lang] = data[fname]
@@ -180,7 +180,7 @@ def process_app(d: Path):
                 (af_dir / f"{afeat}.txt").write_text(
                     data[fname], encoding="utf-8")
 
-        # графика
+        # ГРАФИКА, путь 1: metadata/<appId>/<locale>/images/
         imgs = loc / "images"
         if lang in icons:
             save_img_as_png(icons[lang][1], imgs / "icon.png")
@@ -192,6 +192,26 @@ def process_app(d: Path):
             i += 1
             shot_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy(shot["path"], shot_dir / f"{i}{shot['path'].suffix.lower()}")
+
+        # ГРАФИКА, путь 2: repo/<package-id>/<locale>/ напрямую.
+        # Документированное расположение для простых бинарных репозиториев:
+        # "fdroid update adds all the graphics files it finds in the
+        #  repo to the index".
+        # Дублируем — этот путь используют рабочие репозитории с баннерами.
+        if pkg_name:
+            repo_loc = REPO_DIR / pkg_name / lang
+            if lang in icons:
+                save_img_as_png(icons[lang][1], repo_loc / "icon.png")
+            if lang in banners:
+                save_img_as_png(banners[lang][1],
+                                repo_loc / "featureGraphic.png")
+            repo_shots = repo_loc / "phoneScreenshots"
+            i = 0
+            for shot in [s for s in shots if s["lang"] == lang]:
+                i += 1
+                repo_shots.mkdir(parents=True, exist_ok=True)
+                shutil.copy(shot["path"],
+                            repo_shots / f"{i}{shot['path'].suffix.lower()}")
 
         # changelog: файл <versionCode>.txt для каждой версии +
         # default.txt (фолбэк для клиента, механизм fdroidserver)
@@ -205,7 +225,7 @@ def process_app(d: Path):
 
     cats = [c.strip() for c in main.get("categories", "").split(",") if c.strip()]
 
-    # Builds: нужен и для whatsNew, и для antiFeatures на карточках версий
+    # Builds: нужен и для whatsNew, и для антифич на карточках версий
     # (update.py читает 'antifeatures' именно из Build-записей)
     af_list = sorted(antifeature_reasons.keys())
     builds = []
