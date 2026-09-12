@@ -42,7 +42,8 @@ def split_lang(stem):
 
 def parse_app(d: Path):
     """Читает всю структуру папки приложения."""
-    text, shots, icons, banners = {}, [], {}, {}   # text: lang -> {имя: содержимое}
+    text, shots, icons, banners = {}, [], {}, {}
+    unknown = []                                   # нераспознанные файлы
     for f in sorted(d.iterdir()):
         if f.is_dir():
             continue
@@ -50,29 +51,35 @@ def parse_app(d: Path):
         if m:                                       # 1.jpg, 2.ru.png, ...
             num, lang, ext = m.groups()
             lang = norm_lang(lang) if lang else "en-US"
-            # сортировка: по номеру, jpg перед png при равном номере
             shots.append({"lang": lang, "num": int(num),
                          "png_last": ext.lower() == "png", "path": f})
             continue
         stem, ext = f.stem, f.suffix.lstrip(".").lower()
+        # нормализуем имя для сравнения: без регистра и дефисов
+        stem_norm = stem.lower().replace("-", "_")
         if ext not in ("jpg", "jpeg", "png"):
             name, lang = split_lang(stem)
             lang = lang or "en-US"
             text.setdefault(lang, {})[name] = f.read_text(encoding="utf-8").strip()
-        elif stem == "app_icon":
+        elif stem_norm.startswith("app_icon"):
             name, lang = split_lang(stem)
             lang = lang or "en-US"
             cur = icons.get(lang)
             # jpg предпочтительнее (по вашему правилу), png приоритет ниже
             if cur is None or (cur[0] == "png" and ext in ("jpg", "jpeg")):
                 icons[lang] = (ext, f)
-        elif stem == "horizontal_banner":
+        elif stem_norm.startswith("horizontal_banner"):
             name, lang = split_lang(stem)
             lang = lang or "en-US"
             cur = banners.get(lang)
             if cur is None or (cur[0] == "png" and ext in ("jpg", "jpeg")):
                 banners[lang] = (ext, f)
-    return text, sorted(shots, key=lambda s: (s["lang"], s["num"], s["png_last"])), icons, banners
+        else:
+            unknown.append(f.name)
+    if unknown:
+        print(f"[WARN] {d.name}: нераспознанные файлы: {unknown}")
+    return (text, sorted(shots, key=lambda s: (s["lang"], s["num"], s["png_last"])),
+            icons, banners)
 
 def gh(url):
     r = S.get(url, timeout=120)
@@ -119,7 +126,6 @@ def process_app(d: Path):
 
     # --- скачиваем APK ---
     seen_vc, apk_entries = set(), []
-    pkg_name = None
     for rel in rels:
         tag = rel["tag_name"]
         for asset in rel["assets"]:
@@ -140,7 +146,6 @@ def process_app(d: Path):
             seen_vc.add(vc)
             final = REPO_DIR / f"{pkg}_{vc}.apk"
             shutil.move(tmp, final)
-            pkg_name = pkg                     # запоминаем реальный package name
             apk_entries.append({
                 "version_code": vc,
                 "version_name": str(getattr(apk, "version_name", "") or
@@ -156,10 +161,7 @@ def process_app(d: Path):
     stable_vc = stable_entry["version_code"]
 
     # --- метаданные ---
-    # антифичи: словарь AntiFeature -> locale -> причина (единственный источник:
-    # файлы antifeatures/*.txt больше НЕ пишем, иначе fdroidserver ругается
-    # на Duplicate Anti-Feature declaration)
-    antifeature_reasons = {}
+    all_antifeatures = []
     for lang, data in text.items():
         loc = METADATA_DIR / appid / lang
         loc.mkdir(parents=True, exist_ok=True)
@@ -173,12 +175,21 @@ def process_app(d: Path):
         if full:
             (loc / "full_description.txt").write_text(full, encoding="utf-8")
 
-        # АНТИФИЧИ: только в словарь для yml
+        # АНТИФИЧИ: локализованные файлы причин — именно этот механизм
+        # fdroidserver кладёт текст причин в index-v2 (parse_localized_
+        # antifeatures). Словарь AntiFeatures в yml НЕ пишем: он и вызывал
+        # "Duplicate Anti-Feature declaration"
         for fname, afeat in ANTI_MAP.items():
             if fname in data:
-                antifeature_reasons.setdefault(afeat, {})[lang] = data[fname]
+                if afeat not in all_antifeatures:
+                    all_antifeatures.append(afeat)
+                af_dir = loc / "antifeatures"
+                af_dir.mkdir(parents=True, exist_ok=True)
+                (af_dir / f"{afeat}.txt").write_text(
+                    data[fname], encoding="utf-8")
 
-        # ГРАФИКА, путь 1: metadata/<appId>/<locale>/images/
+        # графика: metadata/<appId>/<locale>/images/
+        # (fdroid update сам скопирует в repo/<pkg>/<locale>/ с хеш-именами)
         imgs = loc / "images"
         if lang in icons:
             save_img_as_png(icons[lang][1], imgs / "icon.png")
@@ -191,23 +202,6 @@ def process_app(d: Path):
             shot_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy(shot["path"], shot_dir / f"{i}{shot['path'].suffix.lower()}")
 
-        # ГРАФИКА, путь 2: repo/<package-id>/<locale>/ напрямую
-        # (документированное расположение для простых бинарных репозиториев)
-        if pkg_name:
-            repo_loc = REPO_DIR / pkg_name / lang
-            if lang in icons:
-                save_img_as_png(icons[lang][1], repo_loc / "icon.png")
-            if lang in banners:
-                save_img_as_png(banners[lang][1],
-                                repo_loc / "featureGraphic.png")
-            repo_shots = repo_loc / "phoneScreenshots"
-            i = 0
-            for shot in [s for s in shots if s["lang"] == lang]:
-                i += 1
-                repo_shots.mkdir(parents=True, exist_ok=True)
-                shutil.copy(shot["path"],
-                            repo_shots / f"{i}{shot['path'].suffix.lower()}")
-
         # changelog: файл <versionCode>.txt для каждой версии +
         # default.txt (фолбэк для клиента, механизм fdroidserver)
         cl_dir = loc / "changelogs"
@@ -218,11 +212,14 @@ def process_app(d: Path):
         (cl_dir / "default.txt").write_text(
             stable_entry["changelog"], encoding="utf-8")
 
+    # отладка: что нашли из графики
+    print(f"[DEBUG] {appid}: icons={sorted(icons)}, "
+          f"banners={sorted(banners)}, langs={sorted(text)}")
+
     cats = [c.strip() for c in main.get("categories", "").split(",") if c.strip()]
 
-    # Builds: нужен и для whatsNew, и для антифич на карточках версий
-    # (update.py читает 'antifeatures' именно из Build-записей)
-    af_list = sorted(antifeature_reasons.keys())
+    # Builds: список в каждом билде -> пометки антифич на карточках версий
+    af_list = sorted(all_antifeatures)
     builds = []
     for e in apk_entries:
         b = {"versionName": e["version_name"], "versionCode": e["version_code"]}
@@ -238,9 +235,6 @@ def process_app(d: Path):
         "Builds": builds,
         "CurrentVersionCode": stable_vc,
     }
-    if antifeature_reasons:
-        # вложенный словарь: AntiFeature -> locale -> причина
-        meta["AntiFeatures"] = antifeature_reasons
     if main.get("website"):
         meta["WebSite"] = main["website"]
     (METADATA_DIR / f"{appid}.yml").write_text(
