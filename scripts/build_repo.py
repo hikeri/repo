@@ -55,12 +55,21 @@ def parse_app(d: Path):
                          "png_last": ext.lower() == "png", "path": f})
             continue
         stem, ext = f.stem, f.suffix.lstrip(".").lower()
-        # нормализуем имя для сравнения: без регистра и дефисов
-        stem_norm = stem.lower().replace("-", "_")
+        stem_norm = stem.lower().replace("-", "_")  # для имён картинок
         if ext not in ("jpg", "jpeg", "png"):
             name, lang = split_lang(stem)
             lang = lang or "en-US"
             text.setdefault(lang, {})[name] = f.read_text(encoding="utf-8").strip()
+            # похоже на антифичу, но такого нет в списке F-Droid
+            if name in ("ads", "disabled-algorithm", "known-vulnerability",
+                        "non-free-addons", "non-free-assets",
+                        "non-free-dependencies", "non-free-network",
+                        "no-sources", "tethered-network", "tracking",
+                        "non-free-components", "non-free-net"):
+                if name not in ANTI_MAP:
+                    print(f"[WARN] {d.name}: '{f.name}' похож на антифичу, "
+                          f"но такой антифичи в F-Droid нет — файл пропущен. "
+                          f"Возможно, имелось в виду 'non-free-dependencies'?")
         elif stem_norm.startswith("app_icon"):
             name, lang = split_lang(stem)
             lang = lang or "en-US"
@@ -161,7 +170,6 @@ def process_app(d: Path):
     stable_vc = stable_entry["version_code"]
 
     # --- метаданные ---
-    all_antifeatures = []
     for lang, data in text.items():
         loc = METADATA_DIR / appid / lang
         loc.mkdir(parents=True, exist_ok=True)
@@ -174,19 +182,6 @@ def process_app(d: Path):
         full = "\n".join(lines[1:]).strip()
         if full:
             (loc / "full_description.txt").write_text(full, encoding="utf-8")
-
-        # АНТИФИЧИ: локализованные файлы причин — именно этот механизм
-        # fdroidserver кладёт текст причин в index-v2 (parse_localized_
-        # antifeatures). Словарь AntiFeatures в yml НЕ пишем: он и вызывал
-        # "Duplicate Anti-Feature declaration"
-        for fname, afeat in ANTI_MAP.items():
-            if fname in data:
-                if afeat not in all_antifeatures:
-                    all_antifeatures.append(afeat)
-                af_dir = loc / "antifeatures"
-                af_dir.mkdir(parents=True, exist_ok=True)
-                (af_dir / f"{afeat}.txt").write_text(
-                    data[fname], encoding="utf-8")
 
         # графика: metadata/<appId>/<locale>/images/
         # (fdroid update сам скопирует в repo/<pkg>/<locale>/ с хеш-именами)
@@ -212,19 +207,27 @@ def process_app(d: Path):
         (cl_dir / "default.txt").write_text(
             stable_entry["changelog"], encoding="utf-8")
 
-    # отладка: что нашли из графики
     print(f"[DEBUG] {appid}: icons={sorted(icons)}, "
           f"banners={sorted(banners)}, langs={sorted(text)}")
 
+    # АНТИФИЧИ: словарь AntiFeature -> локаль -> причина.
+    # Именно эта структура (TYPE_STRINGMAP) пишется в каждый Build —
+    # из неё fdroidserver кладёт текст причин в index-v2
+    antifeature_reasons = {}
+    for lang, data in text.items():
+        for fname, afeat in ANTI_MAP.items():
+            if fname in data:
+                antifeature_reasons.setdefault(afeat, {})[lang] = data[fname]
+
     cats = [c.strip() for c in main.get("categories", "").split(",") if c.strip()]
 
-    # Builds: список в каждом билде -> пометки антифич на карточках версий
-    af_list = sorted(all_antifeatures)
+    # Builds: versionName/versionCode + whatsNew (через changelogs) +
+    # antifeatures как ЛОКАЛИЗОВАННЫЙ СЛОВАРЬ (не список!)
     builds = []
     for e in apk_entries:
         b = {"versionName": e["version_name"], "versionCode": e["version_code"]}
-        if af_list:
-            b["antifeatures"] = af_list
+        if antifeature_reasons:
+            b["antifeatures"] = antifeature_reasons
         builds.append(b)
 
     meta = {
@@ -240,7 +243,7 @@ def process_app(d: Path):
     (METADATA_DIR / f"{appid}.yml").write_text(
         yaml.safe_dump(meta, allow_unicode=True, sort_keys=False), encoding="utf-8")
     print(f"[OK] {appid}: {len(apk_entries)} APK, recommended VC={stable_vc}, "
-          f"antifeatures={af_list}")
+          f"antifeatures={sorted(antifeature_reasons)}")
 
 if __name__ == "__main__":
     if not APPS_DIR.exists():
