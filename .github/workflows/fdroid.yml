@@ -155,12 +155,12 @@ jobs:
 
       - name: Place repo icon
         run: |
-          # fdroid требует в config.yml ИМЯ ФАЙЛА без пути,
-          # а сам ищет его внутри каталога repo/
+          # fdroid ищет иконку в repo/icons/
           if [ -f fdroid-icon.png ]; then
-            cp fdroid-icon.png repo/fdroid-icon.png
+            mkdir -p repo/icons
+            cp fdroid-icon.png repo/icons/fdroid-icon.png
           else
-            echo "fdroid-icon.png не найден, иконки в репозитории не будет"
+            echo "fdroid-icon.png не найден, будет placeholder"
           fi
 
       - name: Run fdroid update
