@@ -36,7 +36,14 @@ jobs:
           python-version: '3.12'
 
       - name: Install dependencies
-        run: pip install requests pyyaml pillow pyaxmlparser
+        run: |
+          # скрипт синхронизации
+          pip install requests pyyaml pillow pyaxmlparser
+          # СВЕЖИЙ androguard: старый из докер-образа падает с
+          # ResParserError: res1 must be zero! на современных APK
+          pip install androguard
+          # fdroidserver из git-мастера (актуальнее любого докер-образа)
+          pip install git+https://gitlab.com/fdroid/fdroidserver.git
 
       - name: Compute repo URL and generate config.yml
         id: repo-url
@@ -90,7 +97,7 @@ jobs:
           repo_name: '${ESC_NAME}'
           repo_description: >-
             ${ESC_DESC}
-          repo_icon: fdroid-icon.png
+          repo_icon: icons/fdroid-icon.png
           # --- ключ для подписи индекса репозитория ---
           keystore: 'keystore.jks'
           repo_keyalias: ${ESC_ALIAS}
@@ -124,14 +131,18 @@ jobs:
           echo "$KEYSTORE" | base64 -d > keystore.jks
           chmod 600 keystore.jks
 
-      # Образ docker-executable-fdroidserver имеет ENTRYPOINT "fdroid",
-      # поэтому аргументы передаются БЕЗ слова fdroid в начале.
-      # Каталог монтируется в /repo, рабочая директория — /repo.
+      - name: Place repo icon
+        run: |
+          # fdroid ищет repo_icon относительно каталога repo/
+          if [ -f fdroid-icon.png ]; then
+            mkdir -p repo/icons
+            cp fdroid-icon.png repo/icons/fdroid-icon.png
+          else
+            echo "fdroid-icon.png не найден, иконки в репозитории не будет"
+          fi
+
       - name: Run fdroid update
-        run: >
-          docker run --rm -v "$PWD":/repo -w /repo
-          registry.gitlab.com/fdroid/docker-executable-fdroidserver:latest
-          update --pretty
+        run: fdroid update --pretty
 
       - name: Assemble site
         env:
@@ -142,13 +153,10 @@ jobs:
             # содержимое каталога repo ложится прямо в корень сайта,
             # путь оканчивается на /repo за счёт имени репозитория
             cp -a repo/. site/
-            # иконка репозитория должна попасть в корень сайта
-            [ -f fdroid-icon.png ] && cp fdroid-icon.png site/fdroid-icon.png || true
           else
             # содержимое каталога repo заворачиваем в подпапку repo,
             # чтобы путь всегда оканчивался на /repo
             cp -a repo site/repo
-            [ -f fdroid-icon.png ] && cp fdroid-icon.png site/repo/fdroid-icon.png || true
           fi
 
       - name: Upload Pages artifact
