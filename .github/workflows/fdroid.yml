@@ -109,11 +109,14 @@ jobs:
           KEYSTORE: ${{ secrets.FDROID_KEYSTORE }}
         run: echo "$KEYSTORE" | base64 -d > keystore.jks
 
+      # Образ docker-executable-fdroidserver имеет ENTRYPOINT "fdroid",
+      # поэтому аргументы передаются БЕЗ слова fdroid в начале.
+      # Каталог монтируется в /repo, рабочая директория — /repo.
       - name: Run fdroid update
         run: >
-          docker run --rm -v "$PWD":/fdroid -w /fdroid
-          registry.gitlab.com/fdroid/fdroidserver:master
-          fdroid update --pretty
+          docker run --rm -v "$PWD":/repo -w /repo
+          registry.gitlab.com/fdroid/docker-executable-fdroidserver:latest
+          update --pretty
 
       - name: Assemble site
         env:
