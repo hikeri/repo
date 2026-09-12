@@ -1,191 +1,245 @@
-name: Build F-Droid repo
+#!/usr/bin/env python3
+"""Конвертирует apps/<appId>/ в метаданные fdroidserver и скачивает APK."""
+import os, re, sys, shutil
+from pathlib import Path
+import requests, yaml
+from PIL import Image
+from pyaxmlparser import APK
 
-# Запуск только вручную из вкладки Actions
-on:
-  workflow_dispatch:
+API = "https://api.github.com"
+APPS_DIR, METADATA_DIR, REPO_DIR = Path("apps"), Path("metadata"), Path("repo")
+S = requests.Session()
+S.headers["Authorization"] = f"Bearer {os.environ['GITHUB_TOKEN']}"
+S.headers["Accept"] = "application/vnd.github+json"
 
-permissions:
-  contents: read
-  pages: write
-  id-token: write
+ANTI_MAP = {  # имя файла -> канонический AntiFeature из fdroidserver
+    "ads": "Ads", "disabled-algorithm": "DisabledAlgorithm",
+    "known-vulnerability": "KnownVuln", "non-free-addons": "NonFreeAdd",
+    "non-free-assets": "NonFreeAssets", "non-free-dependencies": "NonFreeDep",
+    "non-free-network": "NonFreeNet", "no-sources": "NoSourceSince",
+    "tethered-network": "TetheredNet", "tracking": "Tracking",
+}
+LANG_ALIASES = {"ru": "ru-RU", "pt": "pt-BR", "zh": "zh-CN", "no": "nb"}
+SHOT_RE = re.compile(r"^(\d+)(?:\.([a-z]{2}(?:[-_][A-Za-z]{2})?))?\.(jpe?g|png)$", re.I)
+LANG_SUFFIX = re.compile(r"^[a-z]{2}(_[A-Z]{2}|-[A-Za-z]{2})?$")
 
-concurrency:
-  group: fdroid-repo
-  cancel-in-progress: true
+def norm_lang(code):
+    code = code.replace("_", "-")
+    if len(code) == 2 and code in LANG_ALIASES:
+        return LANG_ALIASES[code]
+    if "-" in code:  # ru-ru -> ru-RU
+        l, r = code.split("-", 1)
+        return f"{l}-{r.upper()}"
+    return code
 
-env:
-  # Значения по умолчанию на случай, если variables не заданы
-  FDROID_REPO_NAME: My F-Droid Repo
-  FDROID_REPO_DESCRIPTION: Автоматически собираемый F-Droid репозиторий.
-  # Алиас ключа внутри keystore (совпадает с -alias из команды keytool)
-  FDROID_KEY_ALIAS: fdroid
+def split_lang(stem):
+    """'description.ru' -> ('description', 'ru'); 'description' -> (..., None)"""
+    if "." in stem:
+        base, _, lang = stem.rpartition(".")
+        if LANG_SUFFIX.match(lang):
+            return base, norm_lang(lang)
+    return stem, None
 
-jobs:
-  build:
-    runs-on: ubuntu-latest
-    environment:
-      name: github-pages
-      url: ${{ steps.repo-url.outputs.url }}
-    steps:
-      # ПРОВЕРКА ОБЯЗАТЕЛЬНЫХ СЕКРЕТОВ ДО ЗАПУСКА ВСЕЙ СБОРКИ
-      # GitHub маскирует секреты в логах, поэтому проверяем только
-      # факт их наличия (непустая строка после раскрытия выражения)
-      - name: Validate required secrets
-        run: |
-          MISSING=""
-          if [ -z "${{ secrets.FDROID_PAT }}" ]; then
-            MISSING="$MISSING\n- FDROID_PAT (Personal Access Token для GitHub API)"
-          fi
-          if [ -z "${{ secrets.FDROID_KEYSTORE }}" ]; then
-            MISSING="$MISSING\n- FDROID_KEYSTORE (keystore.jks в base64)"
-          fi
-          if [ -z "${{ secrets.FDROID_KEYSTORE_PASSWORD }}" ]; then
-            MISSING="$MISSING\n- FDROID_KEYSTORE_PASSWORD (пароль keystore)"
-          fi
-          if [ -n "$MISSING" ]; then
-            echo "::error::Отсутствуют обязательные секреты:$MISSING"
-            echo "Создайте их в Settings -> Secrets and variables -> Actions -> Secrets"
-            exit 1
-          fi
-          echo "Все обязательные секреты на месте"
+def parse_app(d: Path):
+    """Читает всю структуру папки приложения."""
+    text, shots, icons, banners = {}, [], {}, {}   # text: lang -> {имя: содержимое}
+    for f in sorted(d.iterdir()):
+        if f.is_dir():
+            continue
+        m = SHOT_RE.match(f.name)
+        if m:                                       # 1.jpg, 2.ru.png, ...
+            num, lang, ext = m.groups()
+            lang = norm_lang(lang) if lang else "en-US"
+            # сортировка: по номеру, jpg перед png при равном номере
+            shots.append({"lang": lang, "num": int(num),
+                         "png_last": ext.lower() == "png", "path": f})
+            continue
+        stem, ext = f.stem, f.suffix.lstrip(".").lower()
+        if ext not in ("jpg", "jpeg", "png"):
+            name, lang = split_lang(stem)
+            lang = lang or "en-US"
+            text.setdefault(lang, {})[name] = f.read_text(encoding="utf-8").strip()
+        elif stem == "app_icon":
+            name, lang = split_lang(stem)
+            lang = lang or "en-US"
+            cur = icons.get(lang)
+            # jpg предпочтительнее (по вашему правилу), png приоритет ниже
+            if cur is None or (cur[0] == "png" and ext in ("jpg", "jpeg")):
+                icons[lang] = (ext, f)
+        elif stem == "horizontal_banner":
+            name, lang = split_lang(stem)
+            lang = lang or "en-US"
+            cur = banners.get(lang)
+            if cur is None or (cur[0] == "png" and ext in ("jpg", "jpeg")):
+                banners[lang] = (ext, f)
+    return text, sorted(shots, key=lambda s: (s["lang"], s["num"], s["png_last"])), icons, banners
 
-      - name: Checkout
-        uses: actions/checkout@v4
+def gh(url):
+    r = S.get(url, timeout=120)
+    r.raise_for_status()
+    return r.json()
 
-      - name: Setup Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
+def save_img_as_png(src: Path, dst: Path):
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    Image.open(src).convert("RGBA" if src.suffix == ".png" else "RGB").save(dst, "PNG")
 
-      - name: Install dependencies
-        run: |
-          # скрипт синхронизации
-          pip install requests pyyaml pillow pyaxmlparser
-          # СВЕЖИЙ androguard: старый из докер-образа падает с
-          # ResParserError: res1 must be zero! на современных APK
-          pip install androguard
-          # fdroidserver из git-мастера (актуальнее любого докер-образа)
-          pip install git+https://gitlab.com/fdroid/fdroidserver.git
+def changelog_text(rel):
+    """Формирует текст changelog из релиза GitHub."""
+    title = f"Version {rel.get('name') or rel['tag_name']}"
+    if rel["prerelease"]:
+        title += " (pre-release)"
+    return (title + "\n\n" + (rel.get("body") or "").strip()).strip()
 
-      - name: Compute repo URL and generate config.yml
-        id: repo-url
-        env:
-          GH_REPOSITORY: ${{ github.repository }}
-          REPO_NAME: ${{ vars.FDROID_REPO_NAME || env.FDROID_REPO_NAME }}
-          REPO_DESCRIPTION: ${{ vars.FDROID_REPO_DESCRIPTION || env.FDROID_REPO_DESCRIPTION }}
-          KEY_ALIAS: ${{ vars.FDROID_KEY_ALIAS || env.FDROID_KEY_ALIAS }}
-        run: |
-          OWNER="${GH_REPOSITORY%/*}"
-          NAME="${GH_REPOSITORY#*/}"
+def process_app(d: Path):
+    appid = d.name
+    text, shots, icons, banners = parse_app(d)
+    main = text.get("en-US", {})
+    github_url = main.get("github_url")
+    if not github_url:
+        print(f"[SKIP] {appid}: нет github_url"); return
 
-          # ПРОВЕРКА ИМЕНИ РЕПОЗИТОРИЯ:
-          # 1) <owner>.github.io -> сайт в корне домена,
-          #    содержимое кладём в подпапку repo,
-          #    итоговый путь: https://owner.github.io/repo/
-          # 2) имя "repo" -> содержимое артефакта в корне сайта,
-          #    итоговый путь оканчивается на /repo за счёт имени репозитория:
-          #    https://owner.github.io/repo/
-          # 3) любое другое имя -> содержимое кладём в подпапку repo:
-          #    https://owner.github.io/<имя>/repo/
-          LOWER_NAME="$(echo "$NAME" | tr '[:upper:]' '[:lower:]')"
-          LOWER_OWNER="$(echo "$OWNER" | tr '[:upper:]' '[:lower:]')"
+    m = re.search(r"github\.com/([^/]+)/([^/]+?)(?:\.git)?/?$", github_url)
+    if not m:
+        print(f"[SKIP] {appid}: не удалось распарсить github_url"); return
+    owner, proj = m.groups()
 
-          if [ "$LOWER_NAME" = "$LOWER_OWNER.github.io" ]; then
-            BASE=""
-            ROOT_DEPLOY="false"
-          elif [ "$LOWER_NAME" = "repo" ]; then
-            BASE="/$NAME"
-            ROOT_DEPLOY="true"
-          else
-            BASE="/$NAME"
-            ROOT_DEPLOY="false"
-          fi
+    # --- лицензия из GitHub API ---
+    info = gh(f"{API}/repos/{owner}/{proj}")
+    license_id = (info.get("license") or {}).get("spdx_id") or "Unknown"
+    if license_id == "NOASSERTION":
+        license_id = "Unknown"
 
-          URL="https://$OWNER.github.io$BASE/"
-          if [ "$ROOT_DEPLOY" = "false" ]; then
-            URL="${URL}repo/"
-          fi
+    # --- последние 3 релиза, в которых есть APK ---
+    rels = gh(f"{API}/repos/{owner}/{proj}/releases?per_page=30")
+    rels = [r for r in rels
+            if any(a["name"].lower().endswith(".apk") for a in r["assets"])]
+    rels = rels[:3]
+    if not rels:
+        print(f"[SKIP] {appid}: нет релизов с APK"); return
 
-          echo "url=$URL" >> "$GITHUB_OUTPUT"
-          echo "root_deploy=$ROOT_DEPLOY" >> "$GITHUB_OUTPUT"
+    # --- скачиваем APK ---
+    seen_vc, apk_entries = set(), []
+    for rel in rels:
+        tag = rel["tag_name"]
+        for asset in rel["assets"]:
+            if not asset["name"].lower().endswith(".apk"):
+                continue
+            tmp = REPO_DIR / f"{appid}_{asset['name']}"
+            tmp.parent.mkdir(parents=True, exist_ok=True)
+            if not tmp.exists():
+                with S.get(asset["browser_download_url"], stream=True, timeout=600) as r:
+                    r.raise_for_status()
+                    with open(tmp, "wb") as fh:
+                        for chunk in r.iter_content(1 << 20):
+                            fh.write(chunk)
+            apk = APK(str(tmp))
+            pkg, vc = apk.package, int(apk.version_code)
+            if vc in seen_vc:                 # одинаковый APK в нескольких релизах
+                tmp.unlink(); continue
+            seen_vc.add(vc)
+            final = REPO_DIR / f"{pkg}_{vc}.apk"
+            shutil.move(tmp, final)
+            apk_entries.append({
+                "version_code": vc,
+                "version_name": str(getattr(apk, "version_name", "") or
+                                    rel.get("name") or tag),
+                "changelog": changelog_text(rel),
+                "prerelease": rel["prerelease"],
+            })
+    apk_entries.sort(key=lambda e: e["version_code"], reverse=True)
 
-          # Экранируем одинарные кавычки для безопасной подстановки в YAML
-          ESC_NAME="$(printf '%s' "$REPO_NAME" | sed "s/'/''/g")"
-          ESC_DESC="$(printf '%s' "$REPO_DESCRIPTION" | sed "s/'/''/g")"
-          ESC_ALIAS="$(printf '%s' "$KEY_ALIAS" | sed 's/[^a-zA-Z0-9_-]//g')"
+    # рекомендуемая версия = последняя СТАБИЛЬНАЯ (пре-релизы не рекомендуются)
+    stable = [e for e in apk_entries if not e["prerelease"]]
+    stable_entry = stable[0] if stable else apk_entries[0]
+    stable_vc = stable_entry["version_code"]
 
-          cat > config.yml <<EOF
-          repo_url: ${URL%/}
-          repo_name: '${ESC_NAME}'
-          repo_description: >-
-            ${ESC_DESC}
-          repo_icon: fdroid-icon.png
-          # --- ключ для подписи индекса репозитория ---
-          keystore: 'keystore.jks'
-          repo_keyalias: ${ESC_ALIAS}
-          keypass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
-          repo_keypass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
-          # --- пароли keystore (для сборки приложений, оставлены на будущее) ---
-          keystorepass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
-          keystorekeypass: ${{ secrets.FDROID_KEYSTORE_PASSWORD }}
-          EOF
+    # --- метаданные ---
+    # антифичи: словарь AntiFeature -> locale -> причина
+    # (формат из документации fdroidserver.metadata)
+    antifeature_reasons = {}
+    for lang, data in text.items():
+        loc = METADATA_DIR / appid / lang
+        loc.mkdir(parents=True, exist_ok=True)
 
-          # fdroid требует права 0600 на config.yml с паролями
-          chmod 600 config.yml
+        # описания: первая строка -> краткое, остальное -> полное
+        desc = data.get("description", "")
+        lines = desc.split("\n")
+        (loc / "short_description.txt").write_text(
+            lines[0].strip()[:80], encoding="utf-8")
+        full = "\n".join(lines[1:]).strip()
+        if full:
+            (loc / "full_description.txt").write_text(full, encoding="utf-8")
 
-          echo "Repo URL: $URL"
-          echo "Repo name: $REPO_NAME"
-          if [ "$ROOT_DEPLOY" = "true" ]; then
-            echo "Deploy mode: корень сайта"
-          else
-            echo "Deploy mode: подпапка /repo"
-          fi
+        # АНТИФИЧИ: собираем локализованные причины в словарь для yml
+        # и пишем файлы antifeatures/<AF>.txt (штатный механизм fdroidserver)
+        for fname, afeat in ANTI_MAP.items():
+            if fname in data:
+                antifeature_reasons.setdefault(afeat, {})[lang] = data[fname]
+                af_dir = loc / "antifeatures"
+                af_dir.mkdir(parents=True, exist_ok=True)
+                (af_dir / f"{afeat}.txt").write_text(
+                    data[fname], encoding="utf-8")
 
-      - name: Sync apps (metadata + APKs)
-        env:
-          GITHUB_TOKEN: ${{ secrets.FDROID_PAT }}
-        run: python scripts/build_repo.py
+        # графика
+        imgs = loc / "images"
+        if lang in icons:
+            save_img_as_png(icons[lang][1], imgs / "icon.png")
+        if lang in banners:
+            save_img_as_png(banners[lang][1], imgs / "featureGraphic.png")
+        shot_dir = imgs / "phoneScreenshots"
+        i = 0
+        for shot in [s for s in shots if s["lang"] == lang]:
+            i += 1
+            shot_dir.mkdir(parents=True, exist_ok=True)
+            shutil.copy(shot["path"], shot_dir / f"{i}{shot['path'].suffix.lower()}")
 
-      - name: Restore keystore
-        env:
-          KEYSTORE: ${{ secrets.FDROID_KEYSTORE }}
-        run: |
-          echo "$KEYSTORE" | base64 -d > keystore.jks
-          chmod 600 keystore.jks
+        # changelog: файл <versionCode>.txt для каждой версии +
+        # default.txt (фолбэк для клиента, механизм fdroidserver)
+        cl_dir = loc / "changelogs"
+        cl_dir.mkdir(parents=True, exist_ok=True)
+        for e in apk_entries:
+            (cl_dir / f"{e['version_code']}.txt").write_text(
+                e["changelog"], encoding="utf-8")
+        (cl_dir / "default.txt").write_text(
+            stable_entry["changelog"], encoding="utf-8")
 
-      - name: Place repo icon
-        run: |
-          # fdroid требует в config.yml ИМЯ ФАЙЛА без пути,
-          # а сам ищет его внутри каталога repo/
-          if [ -f fdroid-icon.png ]; then
-            cp fdroid-icon.png repo/fdroid-icon.png
-          else
-            echo "fdroid-icon.png не найден, иконки в репозитории не будет"
-          fi
+    cats = [c.strip() for c in main.get("categories", "").split(",") if c.strip()]
 
-      - name: Run fdroid update
-        run: fdroid update --pretty
+    # Builds: нужен и для whatsNew, и для antiFeatures на карточках версий
+    # (update.py читает 'antifeatures' именно из Build-записей)
+    af_list = sorted(antifeature_reasons.keys())
+    builds = []
+    for e in apk_entries:
+        b = {"versionName": e["version_name"], "versionCode": e["version_code"]}
+        if af_list:
+            b["antifeatures"] = af_list
+        builds.append(b)
 
-      - name: Assemble site
-        env:
-          ROOT_DEPLOY: ${{ steps.repo-url.outputs.root_deploy }}
-        run: |
-          mkdir -p site
-          if [ "$ROOT_DEPLOY" = "true" ]; then
-            # содержимое каталога repo ложится прямо в корень сайта,
-            # путь оканчивается на /repo за счёт имени репозитория
-            cp -a repo/. site/
-          else
-            # содержимое каталога repo заворачиваем в подпапку repo,
-            # чтобы путь всегда оканчивалось на /repo
-            cp -a repo site/repo
-          fi
+    meta = {
+        "License": license_id,
+        "SourceCode": github_url,
+        "IssueTracker": github_url.rstrip("/") + "/issues",
+        "Categories": cats,
+        "Builds": builds,
+        "CurrentVersionCode": stable_vc,
+    }
+    if antifeature_reasons:
+        # вложенный словарь: AntiFeature -> locale -> причина
+        meta["AntiFeatures"] = antifeature_reasons
+    if main.get("website"):
+        meta["WebSite"] = main["website"]
+    (METADATA_DIR / f"{appid}.yml").write_text(
+        yaml.safe_dump(meta, allow_unicode=True, sort_keys=False), encoding="utf-8")
+    print(f"[OK] {appid}: {len(apk_entries)} APK, recommended VC={stable_vc}, "
+          f"antifeatures={af_list}")
 
-      - name: Upload Pages artifact
-        uses: actions/upload-pages-artifact@v3
-        with:
-          path: site
-
-      - name: Deploy to GitHub Pages
-        id: deploy
-        uses: actions/deploy-pages@v4
+if __name__ == "__main__":
+    if not APPS_DIR.exists():
+        sys.exit("Папка apps/ не найдена")
+    REPO_DIR.mkdir(exist_ok=True)
+    for app_dir in sorted(APPS_DIR.iterdir()):
+        if app_dir.is_dir():
+            try:
+                process_app(app_dir)
+            except Exception as e:
+                print(f"[ERR] {app_dir.name}: {e}")
