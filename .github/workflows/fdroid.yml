@@ -166,6 +166,40 @@ jobs:
       - name: Run fdroid update
         run: fdroid update --pretty
 
+      # ПРОВЕРКА: что реально попало в index-v2.json (структура v2,
+      # не v1: featureGraphic и whatsNew живут по-другому)
+      - name: Verify index contents
+        run: |
+          python3 - <<'EOF'
+          import json
+          d = json.load(open('repo/index-v2.json'))
+
+          # глобальные антифичи, объявленные на уровне репозитория
+          repo_af = list((d['repo'].get('antiFeatures') or {}).keys())
+          print(f"repo-level antiFeatures: {repo_af}")
+
+          for pkg, app in d['packages'].items():
+              md = app['metadata']
+              # v2: featureGraphic/icon — верхнеуровневые локализованные поля
+              banner = sorted((md.get('featureGraphic') or {}).keys()) or "НЕТ"
+              icon = sorted((md.get('icon') or {}).keys()) or "НЕТ"
+              shots = sorted(((md.get('screenshots') or {}).get('phone') or {}).keys()) or "НЕТ"
+              print(f"{pkg}:")
+              print(f"  featureGraphic locales: {banner}")
+              print(f"  icon locales: {icon}")
+              print(f"  phone screenshots locales: {shots}")
+              # какие-либо antiFeatures-поля на уровне пакета
+              pkg_af = md.get('antiFeatures')
+              print(f"  metadata.antiFeatures: {pkg_af if pkg_af else 'НЕТ'}")
+              for h, ver in (app.get('versions') or {}).items():
+                  if not ver:
+                      continue
+                  wn = sorted((ver.get('whatsNew') or {}).keys()) or "НЕТ"
+                  vaf = ver.get('antiFeatures') or "НЕТ"
+                  print(f"  v{ver['manifest']['versionCode']}: "
+                        f"whatsNew locales={wn}, antiFeatures={vaf}")
+          EOF
+
       - name: Assemble site
         env:
           ROOT_DEPLOY: ${{ steps.repo-url.outputs.root_deploy }}
