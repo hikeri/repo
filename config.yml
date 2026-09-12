@@ -1,6 +1,0 @@
-repo_url: https://hikeri.github.io/
-repo_name: Hikeri F-Droid Repo
-repo_description: >-
-  Автоматически собираемый F-Droid репозиторий.
-repo_icon: fdroid-icon.png   # положите иконку в корень
-keystore: 'keystore.jks'
