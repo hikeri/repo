@@ -156,7 +156,9 @@ def process_app(d: Path):
     stable_vc = stable_entry["version_code"]
 
     # --- метаданные ---
-    # антифичи: словарь AntiFeature -> locale -> причина
+    # антифичи: словарь AntiFeature -> locale -> причина (единственный источник:
+    # файлы antifeatures/*.txt больше НЕ пишем, иначе fdroidserver ругается
+    # на Duplicate Anti-Feature declaration)
     antifeature_reasons = {}
     for lang, data in text.items():
         loc = METADATA_DIR / appid / lang
@@ -171,14 +173,10 @@ def process_app(d: Path):
         if full:
             (loc / "full_description.txt").write_text(full, encoding="utf-8")
 
-        # АНТИФИЧИ: локализованные причины (штатный механизм fdroidserver)
+        # АНТИФИЧИ: только в словарь для yml
         for fname, afeat in ANTI_MAP.items():
             if fname in data:
                 antifeature_reasons.setdefault(afeat, {})[lang] = data[fname]
-                af_dir = loc / "antifeatures"
-                af_dir.mkdir(parents=True, exist_ok=True)
-                (af_dir / f"{afeat}.txt").write_text(
-                    data[fname], encoding="utf-8")
 
         # ГРАФИКА, путь 1: metadata/<appId>/<locale>/images/
         imgs = loc / "images"
@@ -193,11 +191,8 @@ def process_app(d: Path):
             shot_dir.mkdir(parents=True, exist_ok=True)
             shutil.copy(shot["path"], shot_dir / f"{i}{shot['path'].suffix.lower()}")
 
-        # ГРАФИКА, путь 2: repo/<package-id>/<locale>/ напрямую.
-        # Документированное расположение для простых бинарных репозиториев:
-        # "fdroid update adds all the graphics files it finds in the
-        #  repo to the index".
-        # Дублируем — этот путь используют рабочие репозитории с баннерами.
+        # ГРАФИКА, путь 2: repo/<package-id>/<locale>/ напрямую
+        # (документированное расположение для простых бинарных репозиториев)
         if pkg_name:
             repo_loc = REPO_DIR / pkg_name / lang
             if lang in icons:
