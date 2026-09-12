@@ -1,0 +1,57 @@
+name: Build F-Droid repo
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: fdroid-repo
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deploy.outputs.page_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install deps
+        run: pip install requests pyyaml pillow pyaxmlparser
+
+      - name: Sync apps (metadata + APKs)
+        env:
+          GITHUB_TOKEN: ${{ secrets.FDROID_PAT }}   # PAT с публичным доступом к API
+        run: python scripts/build_repo.py
+
+      - name: Restore keystore
+        env:
+          KEYSTORE: ${{ secrets.FDROID_KEYSTORE }}
+        run: echo "$KEYSTORE" | base64 -d > keystore.jks
+
+      - name: Run fdroid update
+        run: >
+          docker run --rm -v "$PWD":/fdroid -w /fdroid
+          registry.gitlab.com/fdroid/fdroidserver:master
+          fdroid update --pretty
+
+      - name: Assemble site
+        run: |
+          mkdir -p site && cp -r repo site/repo
+
+      - uses: actions/upload-pages-artifact@v3
+        with:
+          path: site
+
+      - id: deploy
+        uses: actions/deploy-pages@v4
