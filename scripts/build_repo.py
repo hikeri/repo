@@ -150,11 +150,13 @@ def process_app(d: Path):
 
     # рекомендуемая версия = последняя СТАБИЛЬНАЯ (пре-релизы не рекомендуются)
     stable = [e for e in apk_entries if not e["prerelease"]]
-    stable_vc = stable[0]["version_code"] if stable else apk_entries[0]["version_code"]
-    stable_entry = (stable[0] if stable else apk_entries[0])
+    stable_entry = stable[0] if stable else apk_entries[0]
+    stable_vc = stable_entry["version_code"]
 
     # --- метаданные ---
-    all_antifeatures = []
+    # антифичи: словарь AntiFeature -> locale -> причина
+    # (формат из документации fdroidserver.metadata)
+    antifeature_reasons = {}
     for lang, data in text.items():
         loc = METADATA_DIR / appid / lang
         loc.mkdir(parents=True, exist_ok=True)
@@ -168,12 +170,11 @@ def process_app(d: Path):
         if full:
             (loc / "full_description.txt").write_text(full, encoding="utf-8")
 
-        # АнТИФИЧИ: локализованные файлы причин -> клиент показывает
-        # их как родные пометки антифич, а не как текст в описании
+        # АНТИФИЧИ: собираем локализованные причины в словарь для yml
+        # и пишем файлы antifeatures/<AF>.txt (штатный механизм fdroidserver)
         for fname, afeat in ANTI_MAP.items():
             if fname in data:
-                if afeat not in all_antifeatures:
-                    all_antifeatures.append(afeat)
+                antifeature_reasons.setdefault(afeat, {})[lang] = data[fname]
                 af_dir = loc / "antifeatures"
                 af_dir.mkdir(parents=True, exist_ok=True)
                 (af_dir / f"{afeat}.txt").write_text(
@@ -204,10 +205,15 @@ def process_app(d: Path):
 
     cats = [c.strip() for c in main.get("categories", "").split(",") if c.strip()]
 
-    # Builds: без этой секции fdroid update НЕ вставляет whatsNew в индекс
-    # (см. update.py: if build["versionCode"] == versionCode ...)
-    builds = [{"versionName": e["version_name"], "versionCode": e["version_code"]}
-              for e in apk_entries]
+    # Builds: нужен и для whatsNew, и для antiFeatures на карточках версий
+    # (update.py читает 'antifeatures' именно из Build-записей)
+    af_list = sorted(antifeature_reasons.keys())
+    builds = []
+    for e in apk_entries:
+        b = {"versionName": e["version_name"], "versionCode": e["version_code"]}
+        if af_list:
+            b["antifeatures"] = af_list
+        builds.append(b)
 
     meta = {
         "License": license_id,
@@ -217,14 +223,15 @@ def process_app(d: Path):
         "Builds": builds,
         "CurrentVersionCode": stable_vc,
     }
-    if all_antifeatures:
-        meta["AntiFeatures"] = sorted(all_antifeatures)
+    if antifeature_reasons:
+        # вложенный словарь: AntiFeature -> locale -> причина
+        meta["AntiFeatures"] = antifeature_reasons
     if main.get("website"):
         meta["WebSite"] = main["website"]
     (METADATA_DIR / f"{appid}.yml").write_text(
         yaml.safe_dump(meta, allow_unicode=True, sort_keys=False), encoding="utf-8")
     print(f"[OK] {appid}: {len(apk_entries)} APK, recommended VC={stable_vc}, "
-          f"antifeatures={all_antifeatures}")
+          f"antifeatures={af_list}")
 
 if __name__ == "__main__":
     if not APPS_DIR.exists():
