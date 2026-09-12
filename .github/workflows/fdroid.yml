@@ -27,6 +27,28 @@ jobs:
       name: github-pages
       url: ${{ steps.repo-url.outputs.url }}
     steps:
+      # ПРОВЕРКА ОБЯЗАТЕЛЬНЫХ СЕКРЕТОВ ДО ЗАПУСКА ВСЕЙ СБОРКИ
+      # GitHub маскирует секреты в логах, поэтому проверяем только
+      # факт их наличия (непустая строка после раскрытия выражения)
+      - name: Validate required secrets
+        run: |
+          MISSING=""
+          if [ -z "${{ secrets.FDROID_PAT }}" ]; then
+            MISSING="$MISSING\n- FDROID_PAT (Personal Access Token для GitHub API)"
+          fi
+          if [ -z "${{ secrets.FDROID_KEYSTORE }}" ]; then
+            MISSING="$MISSING\n- FDROID_KEYSTORE (keystore.jks в base64)"
+          fi
+          if [ -z "${{ secrets.FDROID_KEYSTORE_PASSWORD }}" ]; then
+            MISSING="$MISSING\n- FDROID_KEYSTORE_PASSWORD (пароль keystore)"
+          fi
+          if [ -n "$MISSING" ]; then
+            echo "::error::Отсутствуют обязательные секреты:$MISSING"
+            echo "Создайте их в Settings -> Secrets and variables -> Actions -> Secrets"
+            exit 1
+          fi
+          echo "Все обязательные секреты на месте"
+
       - name: Checkout
         uses: actions/checkout@v4
 
@@ -97,7 +119,7 @@ jobs:
           repo_name: '${ESC_NAME}'
           repo_description: >-
             ${ESC_DESC}
-          repo_icon: icons/fdroid-icon.png
+          repo_icon: fdroid-icon.png
           # --- ключ для подписи индекса репозитория ---
           keystore: 'keystore.jks'
           repo_keyalias: ${ESC_ALIAS}
@@ -133,10 +155,10 @@ jobs:
 
       - name: Place repo icon
         run: |
-          # fdroid ищет repo_icon относительно каталога repo/
+          # fdroid требует в config.yml ИМЯ ФАЙЛА без пути,
+          # а сам ищет его внутри каталога repo/
           if [ -f fdroid-icon.png ]; then
-            mkdir -p repo/icons
-            cp fdroid-icon.png repo/icons/fdroid-icon.png
+            cp fdroid-icon.png repo/fdroid-icon.png
           else
             echo "fdroid-icon.png не найден, иконки в репозитории не будет"
           fi
@@ -155,7 +177,7 @@ jobs:
             cp -a repo/. site/
           else
             # содержимое каталога repo заворачиваем в подпапку repo,
-            # чтобы путь всегда оканчивался на /repo
+            # чтобы путь всегда оканчивалось на /repo
             cp -a repo site/repo
           fi
 
